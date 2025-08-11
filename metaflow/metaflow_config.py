@@ -214,8 +214,6 @@ CARD_GSROOT = from_conf(
 )
 CARD_NO_WARNING = from_conf("CARD_NO_WARNING", False)
 
-SKIP_CARD_DUALWRITE = from_conf("SKIP_CARD_DUALWRITE", False)
-
 RUNTIME_CARD_RENDER_INTERVAL = from_conf("RUNTIME_CARD_RENDER_INTERVAL", 60)
 
 # Azure storage account URL
@@ -370,6 +368,8 @@ KUBERNETES_CONTAINER_IMAGE = from_conf(
 )
 # Image pull policy for container images
 KUBERNETES_IMAGE_PULL_POLICY = from_conf("KUBERNETES_IMAGE_PULL_POLICY", None)
+# Image pull secrets for container images
+KUBERNETES_IMAGE_PULL_SECRETS = from_conf("KUBERNETES_IMAGE_PULL_SECRETS", "")
 # Default container registry for K8S
 KUBERNETES_CONTAINER_REGISTRY = from_conf(
     "KUBERNETES_CONTAINER_REGISTRY", DEFAULT_CONTAINER_REGISTRY
@@ -450,6 +450,10 @@ CONDA_USE_FAST_INIT = from_conf("CONDA_USE_FAST_INIT", False)
 ESCAPE_HATCH_WARNING = from_conf("ESCAPE_HATCH_WARNING", True)
 
 ###
+# Features
+###
+FEAT_ALWAYS_UPLOAD_CODE_PACKAGE = from_conf("FEAT_ALWAYS_UPLOAD_CODE_PACKAGE", False)
+###
 # Debug configuration
 ###
 DEBUG_OPTIONS = [
@@ -460,6 +464,7 @@ DEBUG_OPTIONS = [
     "stubgen",
     "userconf",
     "conda",
+    "package",
 ]
 
 for typ in DEBUG_OPTIONS:
@@ -546,10 +551,12 @@ def get_pinned_conda_libs(python_version, datastore_type):
         pins["azure-identity"] = ">=1.10.0"
         pins["azure-storage-blob"] = ">=12.12.0"
         pins["azure-keyvault-secrets"] = ">=4.7.0"
+        pins["simple-azure-blob-downloader"] = ">=0.1.0"
     elif datastore_type == "gs":
         pins["google-cloud-storage"] = ">=2.5.0"
         pins["google-auth"] = ">=2.11.0"
         pins["google-cloud-secret-manager"] = ">=2.10.0"
+        pins["simple-gcp-object-downloader"] = ">=0.1.0"
     elif datastore_type == "local":
         pass
     else:

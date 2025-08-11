@@ -7,8 +7,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from metaflow._vendor import click
 from metaflow.debug import debug
 
-from .config_parameters import CONFIG_FILE, ConfigValue
+from .config_parameters import ConfigValue
 from ..exception import MetaflowException, MetaflowInternalError
+from ..packaging_sys import MetaflowCodeContent
 from ..parameters import DeployTimeField, ParameterContext, current_flow
 from ..util import get_username
 
@@ -24,12 +25,16 @@ _CONVERTED_DEFAULT_NO_FILE = _CONVERTED_DEFAULT + _NO_FILE
 
 def _load_config_values(info_file: Optional[str] = None) -> Optional[Dict[Any, Any]]:
     if info_file is None:
-        info_file = os.path.basename(CONFIG_FILE)
-    try:
-        with open(info_file, encoding="utf-8") as contents:
-            return json.load(contents).get("user_configs", {})
-    except IOError:
-        return None
+        config_content = MetaflowCodeContent.get_config()
+    else:
+        try:
+            with open(info_file, encoding="utf-8") as f:
+                config_content = json.load(f)
+        except IOError:
+            return None
+    if config_content:
+        return config_content.get("user_configs", {})
+    return None
 
 
 class ConvertPath(click.Path):
@@ -221,13 +226,13 @@ class ConfigInput:
         if param_name == "config_value":
             self._value_values = {
                 k.lower(): v
-                for k, v in param_value
+                for k, v in param_value.items()
                 if v is not None and not v.startswith(_CONVERTED_DEFAULT)
             }
         else:
             self._path_values = {
                 k.lower(): v
-                for k, v in param_value
+                for k, v in param_value.items()
                 if v is not None and not v.startswith(_CONVERTED_DEFAULT)
             }
         if do_return:
@@ -329,11 +334,11 @@ class ConfigInput:
                 to_return[name] = None
                 flow_cls._flow_state[_FlowState.CONFIGS][name] = None
                 continue
-            if val.startswith(_CONVERTED_DEFAULT_NO_FILE):
-                no_default_file.append(name)
-                continue
             if val.startswith(_CONVERTED_NO_FILE):
                 no_file.append(name)
+                continue
+            if val.startswith(_CONVERTED_DEFAULT_NO_FILE):
+                no_default_file.append(name)
                 continue
 
             val = val[len(_CONVERT_PREFIX) :]  # Remove the _CONVERT_PREFIX
@@ -352,7 +357,9 @@ class ConfigInput:
                         return None
                     raise exc from e
                 flow_cls._flow_state[_FlowState.CONFIGS][name] = read_value
-                to_return[name] = ConfigValue(read_value)
+                to_return[name] = (
+                    ConfigValue(read_value) if read_value is not None else None
+                )
             else:
                 if self._parsers[name]:
                     read_value = self._call_parser(self._parsers[name], val)
@@ -367,7 +374,9 @@ class ConfigInput:
                         continue
                     # TODO: Support YAML
                 flow_cls._flow_state[_FlowState.CONFIGS][name] = read_value
-                to_return[name] = ConfigValue(read_value)
+                to_return[name] = (
+                    ConfigValue(read_value) if read_value is not None else None
+                )
 
         reqs = missing_configs.intersection(self._req_configs)
         for missing in reqs:
@@ -398,7 +407,7 @@ class ConfigInput:
         return self.process_configs(
             ctx.obj.flow.name,
             param.name,
-            value,
+            dict(value),
             ctx.params["quiet"],
             ctx.params["datastore"],
             click_obj=ctx.obj,
@@ -433,7 +442,7 @@ class LocalFileInput(click.Path):
     # Small wrapper around click.Path to set the value from which to read configuration
     # values. This is set immediately upon processing the --local-config-file
     # option and will therefore then be available when processing any of the other
-    # --config options (which will call ConfigInput.process_configs
+    # --config options (which will call ConfigInput.process_configs)
     name = "LocalFileInput"
 
     def convert(self, value, param, ctx):

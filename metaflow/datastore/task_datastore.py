@@ -99,7 +99,6 @@ class TaskDataStore(object):
         mode="r",
         allow_not_done=False,
     ):
-
         self._storage_impl = flow_datastore._storage_impl
         self.TYPE = self._storage_impl.TYPE
         self._ca_store = flow_datastore.ca_store
@@ -118,7 +117,7 @@ class TaskDataStore(object):
         # The GZIP encodings are for backward compatibility
         self._encodings = {"pickle-v2", "gzip+pickle-v2"}
         ver = sys.version_info[0] * 10 + sys.version_info[1]
-        if ver >= 34:
+        if ver >= 36:
             self._encodings.add("pickle-v4")
             self._encodings.add("gzip+pickle-v4")
 
@@ -289,7 +288,7 @@ class TaskDataStore(object):
                     except (SystemError, OverflowError) as e:
                         raise DataException(
                             "Artifact *%s* is very large (over 2GB). "
-                            "You need to use Python 3.4 or newer if you want to "
+                            "You need to use Python 3.6 or newer if you want to "
                             "serialize large objects." % name
                         ) from e
                     except TypeError as e:
@@ -352,7 +351,7 @@ class TaskDataStore(object):
                 encode_type = "gzip+pickle-v2"
             if encode_type not in self._encodings:
                 raise DataException(
-                    "Python 3.4 or later is required to load artifact '%s'" % name
+                    "Python 3.6 or later is required to load artifact '%s'" % name
                 )
             else:
                 to_load[self._objects[name]].append(name)

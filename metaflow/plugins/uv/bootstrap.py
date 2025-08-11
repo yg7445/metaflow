@@ -1,10 +1,13 @@
 import os
+import shutil
 import subprocess
 import sys
 import time
 
 from metaflow.util import which
+from metaflow.meta_files import read_info_file
 from metaflow.metaflow_config import get_pinned_conda_libs
+from metaflow.packaging_sys import MetaflowCodeContent, ContentType
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -78,11 +81,36 @@ if __name__ == "__main__":
         # return only dependency names instead of pinned versions
         return pinned.keys()
 
+    def skip_metaflow_dependencies():
+        skip_pkgs = ["metaflow"]
+        info = read_info_file()
+        if info is not None:
+            try:
+                skip_pkgs.extend([ext_name for ext_name in info["ext_info"][0].keys()])
+            except Exception:
+                print(
+                    "Failed to read INFO. Metaflow-related packages might get installed during runtime."
+                )
+
+        return skip_pkgs
+
     def sync_uv_project(datastore_type):
+        # Move the files to the current directory so uv can find them.
+        for filename in ["uv.lock", "pyproject.toml"]:
+            path_to_file = MetaflowCodeContent.get_filename(
+                filename, ContentType.OTHER_CONTENT
+            )
+            if path_to_file is None:
+                raise RuntimeError(f"Could not find {filename} in the package.")
+            shutil.move(path_to_file, os.path.join(os.getcwd(), filename))
+
         print("Syncing uv project...")
         dependencies = " ".join(get_dependencies(datastore_type))
+        skip_pkgs = " ".join(
+            [f"--no-install-package {dep}" for dep in skip_metaflow_dependencies()]
+        )
         cmd = f"""set -e;
-            uv sync --frozen --no-install-package metaflow;
+            uv sync --frozen {skip_pkgs};
             uv pip install {dependencies} --strict
             """
         run_cmd(cmd)

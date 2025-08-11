@@ -65,6 +65,7 @@ from metaflow.util import (
 )
 
 from .argo_client import ArgoClient
+from .exit_hooks import ExitHookHack, HttpExitHook, ContainerHook
 from metaflow.util import resolve_identity
 
 
@@ -90,6 +91,7 @@ class ArgoWorkflows(object):
         name,
         graph: FlowGraph,
         flow,
+        code_package_metadata,
         code_package_sha,
         code_package_url,
         production_token,
@@ -142,6 +144,7 @@ class ArgoWorkflows(object):
         self.name = name
         self.graph = graph
         self.flow = flow
+        self.code_package_metadata = code_package_metadata
         self.code_package_sha = code_package_sha
         self.code_package_url = code_package_url
         self.production_token = production_token
@@ -204,23 +207,14 @@ class ArgoWorkflows(object):
         return name.replace(".", "-")
 
     @staticmethod
-    def list_templates(flow_name, all=False):
+    def list_templates(flow_name, all=False, page_size=100):
         client = ArgoClient(namespace=KUBERNETES_NAMESPACE)
 
-        templates = client.get_workflow_templates()
-        if templates is None:
-            return []
-
-        template_names = [
-            template["metadata"]["name"]
-            for template in templates
-            if all
-            or flow_name
-            == template["metadata"]
-            .get("annotations", {})
-            .get("metaflow/flow_name", None)
-        ]
-        return template_names
+        for template in client.get_workflow_templates(page_size=page_size):
+            if all or flow_name == template["metadata"].get("annotations", {}).get(
+                "metaflow/flow_name", None
+            ):
+                yield template["metadata"]["name"]
 
     @staticmethod
     def delete(name):
@@ -259,6 +253,7 @@ class ArgoWorkflows(object):
                     flow_name=flow_name, run_id=name
                 )
             )
+        return True
 
     @staticmethod
     def get_workflow_status(flow_name, name):
@@ -550,7 +545,7 @@ class ArgoWorkflows(object):
                 type=param_type,
                 description=param.kwargs.get("help"),
                 is_required=is_required,
-                **extra_attrs
+                **extra_attrs,
             )
         return parameters
 
@@ -795,6 +790,7 @@ class ArgoWorkflows(object):
 
         dag_annotation = {"metaflow/dag": json.dumps(graph_info)}
 
+        lifecycle_hooks = self._lifecycle_hooks()
         return (
             WorkflowTemplate()
             .metadata(
@@ -903,97 +899,20 @@ class ArgoWorkflows(object):
                     if self.enable_error_msg_capture
                     else None
                 )
-                # Set exit hook handlers if notifications are enabled
+                # Set lifecycle hooks if notifications are enabled
                 .hooks(
                     {
-                        **(
-                            {
-                                # workflow status maps to Completed
-                                "notify-slack-on-success": LifecycleHook()
-                                .expression("workflow.status == 'Succeeded'")
-                                .template("notify-slack-on-success"),
-                            }
-                            if self.notify_on_success and self.notify_slack_webhook_url
-                            else {}
-                        ),
-                        **(
-                            {
-                                # workflow status maps to Completed
-                                "notify-pager-duty-on-success": LifecycleHook()
-                                .expression("workflow.status == 'Succeeded'")
-                                .template("notify-pager-duty-on-success"),
-                            }
-                            if self.notify_on_success
-                            and self.notify_pager_duty_integration_key
-                            else {}
-                        ),
-                        **(
-                            {
-                                # workflow status maps to Completed
-                                "notify-incident-io-on-success": LifecycleHook()
-                                .expression("workflow.status == 'Succeeded'")
-                                .template("notify-incident-io-on-success"),
-                            }
-                            if self.notify_on_success
-                            and self.notify_incident_io_api_key
-                            else {}
-                        ),
-                        **(
-                            {
-                                # workflow status maps to Failed or Error
-                                "notify-slack-on-failure": LifecycleHook()
-                                .expression("workflow.status == 'Failed'")
-                                .template("notify-slack-on-error"),
-                                "notify-slack-on-error": LifecycleHook()
-                                .expression("workflow.status == 'Error'")
-                                .template("notify-slack-on-error"),
-                            }
-                            if self.notify_on_error and self.notify_slack_webhook_url
-                            else {}
-                        ),
-                        **(
-                            {
-                                # workflow status maps to Failed or Error
-                                "notify-pager-duty-on-failure": LifecycleHook()
-                                .expression("workflow.status == 'Failed'")
-                                .template("notify-pager-duty-on-error"),
-                                "notify-pager-duty-on-error": LifecycleHook()
-                                .expression("workflow.status == 'Error'")
-                                .template("notify-pager-duty-on-error"),
-                            }
-                            if self.notify_on_error
-                            and self.notify_pager_duty_integration_key
-                            else {}
-                        ),
-                        **(
-                            {
-                                # workflow status maps to Failed or Error
-                                "notify-incident-io-on-failure": LifecycleHook()
-                                .expression("workflow.status == 'Failed'")
-                                .template("notify-incident-io-on-error"),
-                                "notify-incident-io-on-error": LifecycleHook()
-                                .expression("workflow.status == 'Error'")
-                                .template("notify-incident-io-on-error"),
-                            }
-                            if self.notify_on_error and self.notify_incident_io_api_key
-                            else {}
-                        ),
-                        # Warning: terrible hack to workaround a bug in Argo Workflow
-                        #          where the hooks listed above do not execute unless
-                        #          there is an explicit exit hook. as and when this
-                        #          bug is patched, we should remove this effectively
-                        #          no-op hook.
-                        **(
-                            {"exit": LifecycleHook().template("exit-hook-hack")}
-                            if self.notify_on_error or self.notify_on_success
-                            else {}
-                        ),
+                        lifecycle.name: lifecycle
+                        for hook in lifecycle_hooks
+                        for lifecycle in hook.lifecycle_hooks
                     }
                 )
                 # Top-level DAG template(s)
                 .templates(self._dag_templates())
                 # Container templates
                 .templates(self._container_templates())
+                # Lifecycle hook template(s)
+                .templates([hook.template for hook in lifecycle_hooks])
                 # Exit hook template(s)
                 .templates(self._exit_hook_templates())
                 # Sidecar templates (Daemon Containers)
@@ -1570,7 +1489,9 @@ class ArgoWorkflows(object):
                     mflog_expr,
                 ]
                 + self.environment.get_package_commands(
-                    self.code_package_url, self.flow_datastore.TYPE
+                    self.code_package_url,
+                    self.flow_datastore.TYPE,
+                    self.code_package_metadata,
                 )
             )
             step_cmds = self.environment.bootstrap_commands(
@@ -1582,6 +1503,7 @@ class ArgoWorkflows(object):
                     decorator.make_decorator_spec()
                     for decorator in node.decorators
                     if not decorator.statically_defined
+                    and decorator.inserted_by is None
                 ]
             }
             # FlowDecorators can define their own top-level options. They are
@@ -1748,6 +1670,7 @@ class ArgoWorkflows(object):
                     **{
                         # These values are needed by Metaflow to set it's internal
                         # state appropriately.
+                        "METAFLOW_CODE_METADATA": self.code_package_metadata,
                         "METAFLOW_CODE_URL": self.code_package_url,
                         "METAFLOW_CODE_SHA": self.code_package_sha,
                         "METAFLOW_CODE_DS": self.flow_datastore.TYPE,
@@ -2007,6 +1930,7 @@ class ArgoWorkflows(object):
                     namespace=resources["namespace"],
                     image=resources["image"],
                     image_pull_policy=resources["image_pull_policy"],
+                    image_pull_secrets=resources["image_pull_secrets"],
                     service_account=resources["service_account"],
                     secrets=(
                         [
@@ -2193,6 +2117,17 @@ class ArgoWorkflows(object):
                     .node_selectors(resources.get("node_selector"))
                     # Set tolerations
                     .tolerations(resources.get("tolerations"))
+                    # Set image pull secrets if present. We need to use pod_spec_patch due to Argo not supporting this on a template level.
+                    .pod_spec_patch(
+                        {
+                            "imagePullSecrets": [
+                                {"name": secret}
+                                for secret in resources["image_pull_secrets"]
+                            ]
+                        }
+                        if resources["image_pull_secrets"]
+                        else None
+                    )
                     # Set container
                     .container(
                         # TODO: Unify the logic with kubernetes.py
@@ -2333,40 +2268,181 @@ class ArgoWorkflows(object):
             templates.append(self._heartbeat_daemon_template())
         return templates
 
-    # Return exit hook templates for workflow execution notifications.
-    def _exit_hook_templates(self):
-        templates = []
+    # Return lifecycle hooks for workflow execution notifications.
+    def _lifecycle_hooks(self):
+        hooks = []
         if self.notify_on_error:
-            templates.append(self._slack_error_template())
-            templates.append(self._pager_duty_alert_template())
-            templates.append(self._incident_io_alert_template())
+            hooks.append(self._slack_error_template())
+            hooks.append(self._pager_duty_alert_template())
+            hooks.append(self._incident_io_alert_template())
         if self.notify_on_success:
-            templates.append(self._slack_success_template())
-            templates.append(self._pager_duty_change_template())
-            templates.append(self._incident_io_change_template())
+            hooks.append(self._slack_success_template())
+            hooks.append(self._pager_duty_change_template())
+            hooks.append(self._incident_io_change_template())
+
+        exit_hook_decos = self.flow._flow_decorators.get("exit_hook", [])
+
+        for deco in exit_hook_decos:
+            hooks.extend(self._lifecycle_hook_from_deco(deco))
 
         # Clean up None values from templates.
-        templates = list(filter(None, templates))
+        hooks = list(filter(None, hooks))
 
-        if self.notify_on_error or self.notify_on_success:
-            # Warning: terrible hack to workaround a bug in Argo Workflow where the
-            #          templates listed above do not execute unless there is an
-            #          explicit exit hook. as and when this bug is patched, we should
-            #          remove this effectively no-op template.
-            # Note: We use the Http template because changing this to an actual no-op container had the side-effect of
-            # leaving LifecycleHooks in a pending state even when they have finished execution.
-            templates.append(
-                Template("exit-hook-hack").http(
-                    Http("GET")
-                    .url(
+        if hooks:
+            hooks.append(
+                ExitHookHack(
+                    url=(
                         self.notify_slack_webhook_url
                         or "https://events.pagerduty.com/v2/enqueue"
                     )
-                    .success_condition("true == true")
                 )
             )
+        return hooks
+
+    def _lifecycle_hook_from_deco(self, deco):
+        from kubernetes import client as kubernetes_sdk
+
+        start_step = [step for step in self.graph if step.name == "start"][0]
+        # We want to grab the base image used by the start step, as this is known to be pullable from within the cluster,
+        # and it might contain the required libraries, allowing us to start up faster.
+        start_kube_deco = [
+            deco for deco in start_step.decorators if deco.name == "kubernetes"
+        ][0]
+        resources = dict(start_kube_deco.attributes)
+        kube_defaults = dict(start_kube_deco.defaults)
+
+        run_id_template = "argo-{{workflow.name}}"
+        metaflow_version = self.environment.get_environment_info()
+        metaflow_version["flow_name"] = self.graph.name
+        metaflow_version["production_token"] = self.production_token
+        env = {
+            # These values are needed by Metaflow to set it's internal
+            # state appropriately.
+            "METAFLOW_CODE_URL": self.code_package_url,
+            "METAFLOW_CODE_SHA": self.code_package_sha,
+            "METAFLOW_CODE_DS": self.flow_datastore.TYPE,
+            "METAFLOW_SERVICE_URL": SERVICE_INTERNAL_URL,
+            "METAFLOW_SERVICE_HEADERS": json.dumps(SERVICE_HEADERS),
+            "METAFLOW_USER": "argo-workflows",
+            "METAFLOW_DEFAULT_DATASTORE": self.flow_datastore.TYPE,
+            "METAFLOW_DEFAULT_METADATA": DEFAULT_METADATA,
+            "METAFLOW_OWNER": self.username,
+        }
+        # pass on the Run pathspec for script
+        env["RUN_PATHSPEC"] = f"{self.graph.name}/{run_id_template}"
+
+        # support Metaflow sandboxes
+        env["METAFLOW_INIT_SCRIPT"] = KUBERNETES_SANDBOX_INIT_SCRIPT
+
+        env["METAFLOW_WORKFLOW_NAME"] = "{{workflow.name}}"
+        env["METAFLOW_WORKFLOW_NAMESPACE"] = "{{workflow.namespace}}"
+        env = {
+            k: v
+            for k, v in env.items()
+            if v is not None
+            and k not in set(ARGO_WORKFLOWS_ENV_VARS_TO_SKIP.split(","))
+        }
+
+        def _cmd(fn_name):
+            mflog_expr = export_mflog_env_vars(
+                datastore_type=self.flow_datastore.TYPE,
+                stdout_path="$PWD/.logs/mflog_stdout",
+                stderr_path="$PWD/.logs/mflog_stderr",
+                flow_name=self.flow.name,
+                run_id=run_id_template,
+                step_name=f"_hook_{fn_name}",
+                task_id="1",
+                retry_count="0",
+            )
+            cmds = " && ".join(
+                [
+                    # For supporting sandboxes, ensure that a custom script is executed
+                    # before anything else is executed. The script is passed in as an
+                    # env var.
+                    '${METAFLOW_INIT_SCRIPT:+eval \\"${METAFLOW_INIT_SCRIPT}\\"}',
+                    "mkdir -p $PWD/.logs",
+                    mflog_expr,
+                ]
+                + self.environment.get_package_commands(
+                    self.code_package_url, self.flow_datastore.TYPE
+                )[:-1]
+                # Replace the line 'Task in starting'
+                + [f"mflog 'Lifecycle hook {fn_name} is starting.'"]
+                + [
+                    f"python -m metaflow.plugins.exit_hook.exit_hook_script {metaflow_version['script']} {fn_name} $RUN_PATHSPEC"
+                ]
+            )
+
+            cmds = shlex.split('bash -c "%s"' % cmds)
+            return cmds
+
+        def _container(cmds):
+            return to_camelcase(
+                kubernetes_sdk.V1Container(
+                    name="main",
+                    command=cmds,
+                    image=deco.attributes["options"].get("image", None)
+                    or resources["image"],
+                    env=[
+                        kubernetes_sdk.V1EnvVar(name=k, value=str(v))
+                        for k, v in env.items()
+                    ],
+                    env_from=[
+                        kubernetes_sdk.V1EnvFromSource(
+                            secret_ref=kubernetes_sdk.V1SecretEnvSource(
+                                name=str(k),
+                                # optional=True
+                            )
+                        )
+                        for k in list(
+                            []
+                            if not resources.get("secrets")
+                            else (
+                                [resources.get("secrets")]
+                                if isinstance(resources.get("secrets"), str)
+                                else resources.get("secrets")
+                            )
+                        )
+                        + KUBERNETES_SECRETS.split(",")
+                        + ARGO_WORKFLOWS_KUBERNETES_SECRETS.split(",")
+                        if k
+                    ],
+                    resources=kubernetes_sdk.V1ResourceRequirements(
+                        requests={
+                            "cpu": str(kube_defaults["cpu"]),
+                            "memory": "%sM" % str(kube_defaults["memory"]),
+                        }
+                    ),
+                ).to_dict()
+            )
+
+        # create lifecycle hooks from deco
+        hooks = []
+        for success_fn_name in deco.success_hooks:
+            hook = ContainerHook(
+                name=f"success-{success_fn_name.replace('_', '-')}",
+                container=_container(cmds=_cmd(success_fn_name)),
+                service_account_name=resources["service_account"],
+                on_success=True,
+            )
+            hooks.append(hook)
+
+        for error_fn_name in deco.error_hooks:
+            hook = ContainerHook(
+                name=f"error-{error_fn_name.replace('_', '-')}",
+                service_account_name=resources["service_account"],
+                container=_container(cmds=_cmd(error_fn_name)),
+                on_error=True,
+            )
+            hooks.append(hook)
+
+        return hooks
+
+    def _exit_hook_templates(self):
+        templates = []
         if self.enable_error_msg_capture:
             templates.extend(self._error_msg_capture_hook_templates())
+
         return templates
 
     def _error_msg_capture_hook_templates(self):
@@ -2407,7 +2483,9 @@ class ArgoWorkflows(object):
                 mflog_expr,
             ]
             + self.environment.get_package_commands(
-                self.code_package_url, self.flow_datastore.TYPE
+                self.code_package_url,
+                self.flow_datastore.TYPE,
+                self.code_package_metadata,
             )[:-1]
             # Replace the line 'Task in starting'
             # FIXME: this can be brittle.
@@ -2427,6 +2505,7 @@ class ArgoWorkflows(object):
         env = {
             # These values are needed by Metaflow to set it's internal
             # state appropriately.
+            "METAFLOW_CODE_METADATA": self.code_package_metadata,
             "METAFLOW_CODE_URL": self.code_package_url,
             "METAFLOW_CODE_SHA": self.code_package_sha,
             "METAFLOW_CODE_DS": self.flow_datastore.TYPE,
@@ -2515,30 +2594,30 @@ class ArgoWorkflows(object):
         # https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTgx-send-an-alert-event
         if self.notify_pager_duty_integration_key is None:
             return None
-        return Template("notify-pager-duty-on-error").http(
-            Http("POST")
-            .url("https://events.pagerduty.com/v2/enqueue")
-            .header("Content-Type", "application/json")
-            .body(
-                json.dumps(
-                    {
-                        "event_action": "trigger",
-                        "routing_key": self.notify_pager_duty_integration_key,
-                        # "dedup_key": self.flow.name,  # TODO: Do we need deduplication?
-                        "payload": {
-                            "source": "{{workflow.name}}",
-                            "severity": "info",
-                            "summary": "Metaflow run %s/argo-{{workflow.name}} failed!"
-                            % self.flow.name,
-                            "custom_details": {
-                                "Flow": self.flow.name,
-                                "Run ID": "argo-{{workflow.name}}",
-                            },
+        return HttpExitHook(
+            name="notify-pager-duty-on-error",
+            method="POST",
+            url="https://events.pagerduty.com/v2/enqueue",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "event_action": "trigger",
+                    "routing_key": self.notify_pager_duty_integration_key,
+                    # "dedup_key": self.flow.name,  # TODO: Do we need deduplication?
+                    "payload": {
+                        "source": "{{workflow.name}}",
+                        "severity": "info",
+                        "summary": "Metaflow run %s/argo-{{workflow.name}} failed!"
+                        % self.flow.name,
+                        "custom_details": {
+                            "Flow": self.flow.name,
+                            "Run ID": "argo-{{workflow.name}}",
                         },
-                        "links": self._pager_duty_notification_links(),
-                    }
-                )
-            )
+                    },
+                    "links": self._pager_duty_notification_links(),
+                }
+            ),
+            on_error=True,
         )
 
     def _incident_io_alert_template(self):
@@ -2549,50 +2628,52 @@ class ArgoWorkflows(object):
                 "Creating alerts for errors requires a alert source config ID."
             )
         ui_links = self._incident_io_ui_urls_for_run()
-        return Template("notify-incident-io-on-error").http(
-            Http("POST")
-            .url(
+        return HttpExitHook(
+            name="notify-incident-io-on-error",
+            method="POST",
+            url=(
                 "https://api.incident.io/v2/alert_events/http/%s"
                 % self.incident_io_alert_source_config_id
-            )
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer %s" % self.notify_incident_io_api_key)
-            .body(
-                json.dumps(
-                    {
-                        "idempotency_key": "argo-{{workflow.name}}",  # use run id to deduplicate alerts.
-                        "status": "firing",
-                        "title": "Flow %s has failed." % self.flow.name,
-                        "description": "Metaflow run {run_pathspec} failed!{urls}".format(
-                            run_pathspec="%s/argo-{{workflow.name}}" % self.flow.name,
-                            urls=(
-                                "\n\nSee details for the run at:\n\n"
-                                + "\n\n".join(ui_links)
-                                if ui_links
-                                else ""
-                            ),
+            ),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer %s" % self.notify_incident_io_api_key,
+            },
+            body=json.dumps(
+                {
+                    "idempotency_key": "argo-{{workflow.name}}",  # use run id to deduplicate alerts.
+                    "status": "firing",
+                    "title": "Flow %s has failed." % self.flow.name,
+                    "description": "Metaflow run {run_pathspec} failed!{urls}".format(
+                        run_pathspec="%s/argo-{{workflow.name}}" % self.flow.name,
+                        urls=(
+                            "\n\nSee details for the run at:\n\n"
+                            + "\n\n".join(ui_links)
+                            if ui_links
+                            else ""
                         ),
-                        "source_url": (
-                            "%s/%s/%s"
-                            % (
-                                UI_URL.rstrip("/"),
-                                self.flow.name,
-                                "argo-{{workflow.name}}",
-                            )
-                            if UI_URL
-                            else None
-                        ),
-                        "metadata": {
-                            **(self.incident_io_metadata or {}),
-                            **{
-                                "run_status": "failed",
-                                "flow_name": self.flow.name,
-                                "run_id": "argo-{{workflow.name}}",
-                            },
+                    ),
+                    "source_url": (
+                        "%s/%s/%s"
+                        % (
+                            UI_URL.rstrip("/"),
+                            self.flow.name,
+                            "argo-{{workflow.name}}",
+                        )
+                        if UI_URL
+                        else None
+                    ),
+                    "metadata": {
+                        **(self.incident_io_metadata or {}),
+                        **{
+                            "run_status": "failed",
+                            "flow_name": self.flow.name,
+                            "run_id": "argo-{{workflow.name}}",
                         },
-                    }
-                )
-            )
+                    },
+                }
+            ),
+            on_error=True,
         )
 
     def _incident_io_change_template(self):
@@ -2603,50 +2684,52 @@ class ArgoWorkflows(object):
                 "Creating alerts for successes requires an alert source config ID."
             )
         ui_links = self._incident_io_ui_urls_for_run()
-        return Template("notify-incident-io-on-success").http(
-            Http("POST")
-            .url(
+        return HttpExitHook(
+            name="notify-incident-io-on-success",
+            method="POST",
+            url=(
                 "https://api.incident.io/v2/alert_events/http/%s"
                 % self.incident_io_alert_source_config_id
-            )
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer %s" % self.notify_incident_io_api_key)
-            .body(
-                json.dumps(
-                    {
-                        "idempotency_key": "argo-{{workflow.name}}",  # use run id to deduplicate alerts.
-                        "status": "firing",
-                        "title": "Flow %s has succeeded." % self.flow.name,
-                        "description": "Metaflow run {run_pathspec} succeeded!{urls}".format(
-                            run_pathspec="%s/argo-{{workflow.name}}" % self.flow.name,
-                            urls=(
-                                "\n\nSee details for the run at:\n\n"
-                                + "\n\n".join(ui_links)
-                                if ui_links
-                                else ""
-                            ),
+            ),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer %s" % self.notify_incident_io_api_key,
+            },
+            body=json.dumps(
+                {
+                    "idempotency_key": "argo-{{workflow.name}}",  # use run id to deduplicate alerts.
+                    "status": "firing",
+                    "title": "Flow %s has succeeded." % self.flow.name,
+                    "description": "Metaflow run {run_pathspec} succeeded!{urls}".format(
+                        run_pathspec="%s/argo-{{workflow.name}}" % self.flow.name,
+                        urls=(
+                            "\n\nSee details for the run at:\n\n"
+                            + "\n\n".join(ui_links)
+                            if ui_links
+                            else ""
                         ),
-                        "source_url": (
-                            "%s/%s/%s"
-                            % (
-                                UI_URL.rstrip("/"),
-                                self.flow.name,
-                                "argo-{{workflow.name}}",
-                            )
-                            if UI_URL
-                            else None
-                        ),
-                        "metadata": {
-                            **(self.incident_io_metadata or {}),
-                            **{
-                                "run_status": "succeeded",
-                                "flow_name": self.flow.name,
-                                "run_id": "argo-{{workflow.name}}",
-                            },
+                    ),
+                    "source_url": (
+                        "%s/%s/%s"
+                        % (
+                            UI_URL.rstrip("/"),
+                            self.flow.name,
+                            "argo-{{workflow.name}}",
+                        )
+                        if UI_URL
+                        else None
+                    ),
+                    "metadata": {
+                        **(self.incident_io_metadata or {}),
+                        **{
+                            "run_status": "succeeded",
+                            "flow_name": self.flow.name,
+                            "run_id": "argo-{{workflow.name}}",
                         },
-                    }
-                )
-            )
+                    },
+                }
+            ),
+            on_success=True,
         )
 
     def _incident_io_ui_urls_for_run(self):
@@ -2671,27 +2754,27 @@ class ArgoWorkflows(object):
         # https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTgy-send-a-change-event
         if self.notify_pager_duty_integration_key is None:
             return None
-        return Template("notify-pager-duty-on-success").http(
-            Http("POST")
-            .url("https://events.pagerduty.com/v2/change/enqueue")
-            .header("Content-Type", "application/json")
-            .body(
-                json.dumps(
-                    {
-                        "routing_key": self.notify_pager_duty_integration_key,
-                        "payload": {
-                            "summary": "Metaflow run %s/argo-{{workflow.name}} Succeeded"
-                            % self.flow.name,
-                            "source": "{{workflow.name}}",
-                            "custom_details": {
-                                "Flow": self.flow.name,
-                                "Run ID": "argo-{{workflow.name}}",
-                            },
+        return HttpExitHook(
+            name="notify-pager-duty-on-success",
+            method="POST",
+            url="https://events.pagerduty.com/v2/change/enqueue",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "routing_key": self.notify_pager_duty_integration_key,
+                    "payload": {
+                        "summary": "Metaflow run %s/argo-{{workflow.name}} Succeeded"
+                        % self.flow.name,
+                        "source": "{{workflow.name}}",
+                        "custom_details": {
+                            "Flow": self.flow.name,
+                            "Run ID": "argo-{{workflow.name}}",
                         },
-                        "links": self._pager_duty_notification_links(),
-                    }
-                )
-            )
+                    },
+                    "links": self._pager_duty_notification_links(),
+                }
+            ),
+            on_success=True,
         )
 
     def _pager_duty_notification_links(self):
@@ -2795,8 +2878,12 @@ class ArgoWorkflows(object):
             blocks = self._get_slack_blocks(message)
             payload = {"text": message, "blocks": blocks}
 
-        return Template("notify-slack-on-error").http(
-            Http("POST").url(self.notify_slack_webhook_url).body(json.dumps(payload))
+        return HttpExitHook(
+            name="notify-slack-on-error",
+            method="POST",
+            url=self.notify_slack_webhook_url,
+            body=json.dumps(payload),
+            on_error=True,
         )
 
     def _slack_success_template(self):
@@ -2811,8 +2898,12 @@ class ArgoWorkflows(object):
             blocks = self._get_slack_blocks(message)
             payload = {"text": message, "blocks": blocks}
 
-        return Template("notify-slack-on-success").http(
-            Http("POST").url(self.notify_slack_webhook_url).body(json.dumps(payload))
+        return HttpExitHook(
+            name="notify-slack-on-success",
+            method="POST",
+            url=self.notify_slack_webhook_url,
+            body=json.dumps(payload),
+            on_success=True,
         )
 
     def _heartbeat_daemon_template(self):
@@ -2871,7 +2962,8 @@ class ArgoWorkflows(object):
                 mflog_expr,
             ]
             + self.environment.get_package_commands(
-                self.code_package_url, self.flow_datastore.TYPE
+                self.code_package_url,
+                self.flow_datastore.TYPE,
             )[:-1]
             # Replace the line 'Task in starting'
             # FIXME: this can be brittle.
@@ -2886,6 +2978,7 @@ class ArgoWorkflows(object):
         env = {
             # These values are needed by Metaflow to set it's internal
             # state appropriately.
+            "METAFLOW_CODE_METADATA": self.code_package_metadata,
             "METAFLOW_CODE_URL": self.code_package_url,
             "METAFLOW_CODE_SHA": self.code_package_sha,
             "METAFLOW_CODE_DS": self.flow_datastore.TYPE,
@@ -3134,8 +3227,8 @@ class ArgoWorkflows(object):
                     Trigger().template(
                         TriggerTemplate(self.name)
                         # Trigger a deployed workflow template
-                        .argo_workflow_trigger(
-                            ArgoWorkflowTrigger()
+                        .k8s_trigger(
+                            StandardK8STrigger()
                             .source(
                                 {
                                     "resource": {
@@ -3733,6 +3826,14 @@ class Template(object):
             )
         return self
 
+    def pod_spec_patch(self, pod_spec_patch=None):
+        if pod_spec_patch is None:
+            return self
+
+        self.payload["podSpecPatch"] = json.dumps(pod_spec_patch)
+
+        return self
+
     def node_selectors(self, node_selectors):
         if "nodeSelector" not in self.payload:
             self.payload["nodeSelector"] = {}
@@ -4105,6 +4206,10 @@ class TriggerTemplate(object):
         self.payload = tree()
         self.payload["name"] = name
 
+    def k8s_trigger(self, k8s_trigger):
+        self.payload["k8s"] = k8s_trigger.to_json()
+        return self
+
     def argo_workflow_trigger(self, argo_workflow_trigger):
         self.payload["argoWorkflow"] = argo_workflow_trigger.to_json()
         return self
@@ -4181,51 +4286,51 @@ class TriggerParameter(object):
         return json.dumps(self.payload, indent=4)
 
 
-class Http(object):
-    # https://argoproj.github.io/argo-workflows/fields/#http
-
-    def __init__(self, method):
-        tree = lambda: defaultdict(tree)
-        self.payload = tree()
-        self.payload["method"] = method
-        self.payload["headers"] = []
-
-    def header(self, header, value):
-        self.payload["headers"].append({"name": header, "value": value})
-        return self
-
-    def body(self, body):
-        self.payload["body"] = str(body)
-        return self
-
-    def url(self, url):
-        self.payload["url"] = url
-        return self
-
-    def success_condition(self, success_condition):
-        self.payload["successCondition"] = success_condition
-        return self
-
-    def to_json(self):
-        return self.payload
-
-    def __str__(self):
-        return json.dumps(self.payload, indent=4)
-
-
-class LifecycleHook(object):
-    # https://argoproj.github.io/argo-workflows/fields/#lifecyclehook
+class StandardK8STrigger(object):
+    # https://pkg.go.dev/github.com/argoproj/argo-events/pkg/apis/sensor/v1alpha1#StandardK8STrigger
 
     def __init__(self):
         tree = lambda: defaultdict(tree)
         self.payload = tree()
+        self.payload["operation"] = "create"
 
-    def expression(self, expression):
-        self.payload["expression"] = str(expression)
+    def operation(self, operation):
+        self.payload["operation"] = operation
         return self
 
-    def template(self, template):
-        self.payload["template"] = template
+    def group(self, group):
+        self.payload["group"] = group
+        return self
+
+    def version(self, version):
+        self.payload["version"] = version
+        return self
+
+    def resource(self, resource):
+        self.payload["resource"] = resource
+        return self
+
+    def namespace(self, namespace):
+        self.payload["namespace"] = namespace
+        return self
+
+    def source(self, source):
+        self.payload["source"] = source
+        return self
+
+    def parameters(self, trigger_parameters):
+        if "parameters" not in self.payload:
+            self.payload["parameters"] = []
+        for trigger_parameter in trigger_parameters:
+            self.payload["parameters"].append(trigger_parameter.to_json())
+        return self
+
+    def live_object(self, live_object=True):
+        self.payload["liveObject"] = live_object
+        return self
+
+    def patch_strategy(self, patch_strategy):
+        self.payload["patchStrategy"] = patch_strategy
         return self
 
     def to_json(self):
